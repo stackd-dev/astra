@@ -1,20 +1,25 @@
 #!/usr/bin/env node
-import * as cdk from 'aws-cdk-lib/core';
-import { AstraStack } from '../lib/astra-stack';
+import "source-map-support/register";
+import { App } from "aws-cdk-lib";
+import { AstraDataStack } from "../lib/astra-data-stack";
+import { AstraIngestStack } from "../lib/astra-ingest-stack";
+import { AstraProcessorStack } from "../lib/astra-processor-stack";
 
-const app = new cdk.App();
-new AstraStack(app, 'AstraStack', {
-  /* If you don't specify 'env', this stack will be environment-agnostic.
-   * Account/Region-dependent features and context lookups will not work,
-   * but a single synthesized template can be deployed anywhere. */
+const app = new App();
 
-  /* Uncomment the next line to specialize this stack for the AWS Account
-   * and Region that are implied by the current CLI configuration. */
-  // env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
+// Base infrastructure
+const data = new AstraDataStack(app, "AstraDataStack", {});
 
-  /* Uncomment the next line if you know exactly what Account and Region you
-   * want to deploy the stack to. */
-  // env: { account: '123456789012', region: 'us-east-1' },
+// Ingestion (Finnhub → SQS)
+new AstraIngestStack(app, "AstraIngestStack", {
+  queue: data.queue,
+  finnhubSecret: data.finnhubSecret,
+});
 
-  /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
+// Processing (filtering + Slack)
+new AstraProcessorStack(app, "AstraProcessorStack", {
+  queue: data.queue,
+  alertsTopic: data.alertsTopic,
+  slackSecret: data.slackSecret,
+  seenTable: data.seenTable,
 });
