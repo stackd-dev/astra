@@ -5,12 +5,18 @@
     "astra": "bin/astra.js"
   },
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc -w",
+    "postinstall": "cd services/feed-listener && if [ ! -d node_modules ]; then npm ci; fi",
+    "clean": "echo '🧹 Cleaning build artifacts...' && rm -rf dist cdk.out node_modules && find services -type d -name dist -prune -exec rm -rf {} + && find services -type d -name node_modules -prune -exec rm -rf {} +",
+    "build": "npm run build:cdk && npm run build:feed",
+    "build:cdk": "tsc --project tsconfig.json",
+    "build:feed": "cd services/feed-listener && npx tsc --project tsconfig.json",
+    "watch": "tsc -w --project tsconfig.json",
     "test": "jest",
-    "cdk": "cdk"
+    "cdk": "cdk",
+    "dev:feed": "cd services/feed-listener && npx ts-node src/index.ts"
   },
   "devDependencies": {
+    "@types/aws-lambda": "^8.10.135",
     "@types/jest": "^29.5.14",
     "@types/node": "22.7.9",
     "jest": "^29.7.0",
@@ -20,7 +26,12 @@
     "typescript": "~5.6.3"
   },
   "dependencies": {
+    "@aws-sdk/client-sns": "^3.678.0",
+    "@aws-sdk/client-dynamodb": "^3.678.0",
+    "@aws-sdk/client-secrets-manager": "^3.678.0",
+    "@aws-sdk/client-sqs": "^3.678.0",
     "aws-cdk-lib": "2.215.0",
-    "constructs": "^10.0.0"
+    "constructs": "^10.0.0",
+    "node-fetch": "^3.3.2"
   }
 }

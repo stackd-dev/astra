@@ -12,7 +12,6 @@ import { join } from "path";
 interface AstraProcessorStackProps extends StackProps {
   queue: Queue;
   alertsTopic: Topic;
-  slackSecret: Secret;
   seenTable: Table;
 }
 
@@ -27,7 +26,6 @@ export class AstraProcessorStack extends Stack {
       environment: {
         ALERTS_TOPIC_ARN: props.alertsTopic.topicArn,
         SEEN_TABLE: props.seenTable.tableName,
-        SLACK_SECRET_ARN: props.slackSecret.secretArn,
       },
     });
     processor.addEventSource(new SqsEventSource(props.queue));
@@ -35,6 +33,5 @@ export class AstraProcessorStack extends Stack {
     props.queue.grantConsumeMessages(processor);
     props.seenTable.grantReadWriteData(processor);
     props.alertsTopic.grantPublish(processor);
-    props.slackSecret.grantRead(processor);
   }
 }

@@ -3,10 +3,10 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": [
-      "es2022"
-    ],
-    "declaration": true,
+    "lib": ["es2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "declaration": false,
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
@@ -21,12 +21,14 @@
     "experimentalDecorators": true,
     "strictPropertyInitialization": false,
     "skipLibCheck": true,
-    "typeRoots": [
-      "./node_modules/@types"
-    ]
+    "typeRoots": ["./node_modules/@types"]
   },
+  "include": ["bin/**/*.ts", "lib/**/*.ts"],
   "exclude": [
     "node_modules",
-    "cdk.out"
+    "cdk.out",
+    "services",
+    "lambdas",
+    "dist"
   ]
 }

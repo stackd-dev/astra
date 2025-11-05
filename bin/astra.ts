@@ -20,6 +20,5 @@ new AstraIngestStack(app, "AstraIngestStack", {
 new AstraProcessorStack(app, "AstraProcessorStack", {
   queue: data.queue,
   alertsTopic: data.alertsTopic,
-  slackSecret: data.slackSecret,
   seenTable: data.seenTable,
 });

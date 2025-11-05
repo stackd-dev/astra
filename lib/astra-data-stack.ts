@@ -10,7 +10,6 @@ export class AstraDataStack extends Stack {
   public readonly alertsTopic: Topic;
   public readonly seenTable: Table;
   public readonly finnhubSecret: Secret;
-  public readonly slackSecret: Secret;
 
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
@@ -27,6 +26,5 @@ export class AstraDataStack extends Stack {
     });
 
     this.finnhubSecret = new Secret(this, "FinnhubToken");
-    this.slackSecret = new Secret(this, "SlackWebhook");
   }
 }
