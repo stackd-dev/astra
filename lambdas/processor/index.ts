@@ -1,6 +1,7 @@
 import { SQSEvent } from "aws-lambda";
 import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
+import { NewsArticlePayload } from "./types";
 
 // --- AWS clients (reused across invocations)
 const sns = new SNSClient({});
@@ -60,14 +61,17 @@ export const handler = async (event: SQSEvent) => {
 
 async function processRecord(record: SQSEvent["Records"][0]) {
   try {
-    const msg = JSON.parse(record.body);
+    const msg: NewsArticlePayload = JSON.parse(record.body);
     const headline = msg.headline ?? "";
     const url = msg.url ?? "";
     const publishedAt = msg.publishedAt ?? new Date().toISOString();
     const id = Buffer.from(`${headline}-${publishedAt}`).toString("base64");
 
     // Filter: only process NVIDIA or OpenAI mentions
-    if (!pattern.test(headline)) return;
+    if (!pattern.test(headline)) {
+      console.log("⏭️ No relevant keywords found:", headline);
+      return;
+    }
 
     // Deduplicate using DynamoDB conditional put
     try {
@@ -84,7 +88,7 @@ async function processRecord(record: SQSEvent["Records"][0]) {
       );
     } catch (err: any) {
       if (err.name === "ConditionalCheckFailedException") {
-        console.log("⏭️ Duplicate skipped:", headline);
+        console.log("⏭️ Duplicate news skipped:", headline);
         return;
       }
       throw err;
@@ -93,13 +97,13 @@ async function processRecord(record: SQSEvent["Records"][0]) {
     // Construct alert message
     const message = `🚀 *${headline}*\n${url}\nSource: ${
       msg.source ?? "Unknown"
-    }`;
+    }\nPublished at: ${publishedAt}`;
 
     // Publish to SNS (this can be extended later to Slack, etc.)
     await sns.send(
       new PublishCommand({
         TopicArn: ALERTS_TOPIC_ARN,
-        Subject: "NVIDIA/OpenAI News Alert",
+        Subject: "News Alert",
         Message: message,
       })
     );
