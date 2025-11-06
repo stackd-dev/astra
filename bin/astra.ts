@@ -13,7 +13,7 @@ const data = new AstraDataStack(app, "AstraDataStack", {});
 // Ingestion (Finnhub → SQS)
 new AstraIngestStack(app, "AstraIngestStack", {
   queue: data.queue,
-  finnhubSecret: data.finnhubSecret,
+  feedSecret: data.feedSecret,
 });
 
 // Processing (filtering + Slack)

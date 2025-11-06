@@ -13,6 +13,7 @@
     "watch": "tsc -w --project tsconfig.json",
     "test": "jest",
     "cdk": "cdk",
+    "deploy": "npm run build && cdk synth && cdk deploy --all --require-approval never",
     "dev:feed": "cd services/feed-listener && npx ts-node src/index.ts"
   },
   "devDependencies": {

@@ -3,7 +3,6 @@ import { Construct } from "constructs";
 import { Queue } from "aws-cdk-lib/aws-sqs";
 import { Table } from "aws-cdk-lib/aws-dynamodb";
 import { Topic } from "aws-cdk-lib/aws-sns";
-import { Secret } from "aws-cdk-lib/aws-secretsmanager";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { Runtime } from "aws-cdk-lib/aws-lambda";

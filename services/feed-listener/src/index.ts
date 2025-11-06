@@ -1,12 +1,13 @@
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
-import WebSocket from "ws";
+import { FinlightApi } from "finlight-client";
+import { NewsArticlePayload } from "./types.js";
 
 const REGION = process.env.AWS_REGION ?? "us-east-1";
 const QUEUE_URL = process.env.QUEUE_URL!;
-const FINNHUB_TOKEN = process.env.FEED_TOKEN!; // ECS injects actual token value
+const FINLIGHT_TOKEN = process.env.FEED_TOKEN!;
 const LOG_LEVEL = process.env.LOG_LEVEL ?? "info";
 
-if (!QUEUE_URL || !FINNHUB_TOKEN) {
+if (!QUEUE_URL || !FINLIGHT_TOKEN) {
   console.error(
     "Missing required environment variables QUEUE_URL or FEED_TOKEN"
   );
@@ -24,65 +25,59 @@ function log(level: LogLevel, ...args: unknown[]) {
   }
 }
 
-async function startFinnhubListener(token: string) {
-  const url = `wss://ws.finnhub.io?token=${encodeURIComponent(token)}`;
+// ---------------- FINLIGHT IMPLEMENTATION ----------------
 
-  const connect = () => {
-    log("info", "Connecting to Finnhub WebSocket…");
-    const ws = new WebSocket(url);
+async function startFinlightListener(apiKey: string) {
+  const client = new FinlightApi(
+    { apiKey },
+    { takeover: true } // auto close old connections if limit reached
+  );
 
-    ws.on("open", () => log("info", "Connected to Finnhub WebSocket"));
+  log("info", "Connecting to Finlight WebSocket…");
 
-    ws.on("message", async (raw) => {
+  client.websocket.connect(
+    {
+      query: "(Nvidia OR OpenAI)",
+      language: "en",
+      countries: ["us"],
+    },
+    async (article: any) => {
       try {
-        const msg = JSON.parse(raw.toString());
-        if (!Array.isArray(msg.data)) return;
-        for (const n of msg.data) {
-          const payload = {
-            provider: "finnhub",
-            headline: n.headline,
-            source: n.source,
-            url: n.url,
-            publishedAt: new Date(n.datetime || Date.now()).toISOString(),
-            related: n.related ?? "",
-            summary: n.summary ?? "",
-          };
-          await sqs.send(
-            new SendMessageCommand({
-              QueueUrl: QUEUE_URL,
-              MessageBody: JSON.stringify(payload),
-            })
-          );
-        }
+        console.log(
+          `Received article: ${article.title} at ${new Date().toISOString()}`
+        );
+
+        const payload: NewsArticlePayload = {
+          provider: "finlight",
+          headline: article.title,
+          source: article.source ?? "unknown",
+          url: article.url ?? "",
+          publishedAt: article.publishedAt ?? new Date().toISOString(),
+          summary: article.summary ?? "",
+          companies: article.companies ?? [],
+          raw: article,
+        };
+
+        await sqs.send(
+          new SendMessageCommand({
+            QueueUrl: QUEUE_URL,
+            MessageBody: JSON.stringify(payload),
+          })
+        );
+
+        log("info", "Pushed article to SQS:", payload.headline);
       } catch (err) {
-        log("warn", "Failed to parse message:", (err as Error).message);
+        log("warn", "Failed to process article:", (err as Error).message);
       }
-    });
-
-    ws.on("close", () => {
-      log("warn", "WebSocket closed. Reconnecting in 2s…");
-      setTimeout(connect, 2000);
-    });
-
-    ws.on("error", (err) => {
-      log("warn", "WebSocket error:", (err as Error).message);
-      ws.close();
-    });
-
-    // keep-alive ping
-    const heartbeat = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.ping();
-    }, 15000);
-
-    ws.on("close", () => clearInterval(heartbeat));
-  };
-
-  connect();
+    }
+  );
 }
 
+// ---------------- ENTRYPOINT ----------------
+
 async function main() {
-  await startFinnhubListener(FINNHUB_TOKEN);
-  process.stdin.resume(); // keep the container alive
+  await startFinlightListener(FINLIGHT_TOKEN);
+  process.stdin.resume(); // keep container alive
 }
 
 main().catch((err) => {

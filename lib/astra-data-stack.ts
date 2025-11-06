@@ -9,7 +9,7 @@ export class AstraDataStack extends Stack {
   public readonly queue: Queue;
   public readonly alertsTopic: Topic;
   public readonly seenTable: Table;
-  public readonly finnhubSecret: Secret;
+  public readonly feedSecret: Secret;
 
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
@@ -25,6 +25,6 @@ export class AstraDataStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    this.finnhubSecret = new Secret(this, "FinnhubToken");
+    this.feedSecret = new Secret(this, "FeedToken");
   }
 }

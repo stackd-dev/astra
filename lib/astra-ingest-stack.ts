@@ -23,7 +23,7 @@ import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 
 interface AstraIngestStackProps extends StackProps {
   queue: Queue;
-  finnhubSecret: Secret;
+  feedSecret: Secret;
 }
 
 export class AstraIngestStack extends Stack {
@@ -77,7 +77,7 @@ export class AstraIngestStack extends Stack {
         LOG_LEVEL: "info",
       },
       secrets: {
-        FEED_TOKEN: EcsSecret.fromSecretsManager(props.finnhubSecret),
+        FEED_TOKEN: EcsSecret.fromSecretsManager(props.feedSecret),
       },
     });
 
@@ -105,6 +105,6 @@ export class AstraIngestStack extends Stack {
     // The container can send messages to SQS and read its Finnhub secret.
     //
     props.queue.grantSendMessages(task.taskRole);
-    props.finnhubSecret.grantRead(task.taskRole);
+    props.feedSecret.grantRead(task.taskRole);
   }
 }
