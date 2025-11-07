@@ -38,6 +38,7 @@ const NVIDIA_KEYWORDS = [
 // --- OpenAI-related keywords
 const OPENAI_KEYWORDS = [
   "OpenAI",
+  "AI",
   "GPT-4",
   "GPT-4o",
   "GPT-4 Turbo",
@@ -73,17 +74,19 @@ async function processRecord(record: SQSEvent["Records"][0]) {
       return;
     }
 
+    console.log("✅ Relevant article found:", headline);
+
     // Deduplicate using DynamoDB conditional put
     try {
       await db.send(
         new PutItemCommand({
           TableName: SEEN_TABLE,
           Item: {
-            id: { S: id },
+            contentHash: { S: id },
             headline: { S: headline },
             publishedAt: { S: publishedAt },
           },
-          ConditionExpression: "attribute_not_exists(id)",
+          ConditionExpression: "attribute_not_exists(contentHash)",
         })
       );
     } catch (err: any) {

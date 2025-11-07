@@ -38,8 +38,6 @@ async function startFinlightListener(apiKey: string) {
   client.websocket.connect(
     {
       query: "(Nvidia OR OpenAI)",
-      language: "en",
-      countries: ["us"],
     },
     async (article: any) => {
       try {
