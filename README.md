@@ -1,250 +1,105 @@
-# 🌌 Astra
+# astra
 
-**Real-Time Market Signal Detection System**
+A semi-automated earnings options trading system. The system researches
+upcoming earnings, auto-enters options positions the afternoon before the
+announcement, holds exactly one overnight, and surfaces the exit decision to a
+human at the next market open. **Entry is automated; exit is manual.**
 
----
+The repo started as a real-time news-alerter prototype and has been rewritten
+ground-up into the trading system described here. Validated patterns from the
+prior version (persistent WebSocket → SQS → processor, content-hash dedup,
+Secrets-Manager-everything, modular stacks) are kept as guidelines, not code.
 
-## 🧭 Overview
+## Source of truth
 
-**Astra** continuously monitors financial news feeds to detect **market-moving announcements** — for example, partnerships or collaborations involving **NVIDIA** or **OpenAI**.
-When a relevant headline appears, Astra filters it, deduplicates it, and sends an instant alert to Slack — typically within **one second** of publication.
+Read these before changing anything in the repo:
 
-Astra forms the **signal intelligence layer** that can later power automated trading, sentiment analysis, or research workflows.
+- **[CLAUDE.md](CLAUDE.md)** — lean rules-and-decisions file (auto-loaded for
+  Claude Code sessions). The trade pattern, stack layout, tech choices, safety
+  rails, build sequence, and the list of explicitly-rejected ideas.
+- **[docs/earnings-system-design.md](docs/earnings-system-design.md)** — full
+  per-component reference: timing clock, per-component specs, data contracts,
+  DynamoDB schemas, S3 paths, the two operating modes.
 
----
+## The core trade pattern (one paragraph)
 
-## 🛰️ System Architecture
+Enter the afternoon before the earnings announcement (~12:30 PT, the final ~30
+minutes before the 1pm PT close), hold exactly one overnight, exit at the next
+market open. AMC tickers (report after-close) give an after-hours preview
+that's a signal only — retail can't trade options after-hours; the monitor
+folds it into the morning exit alert. BMO tickers (report pre-open) get no
+preview — react at the bell. Same `hold_until` rule for both. There is no
+same-day intraday path; entry is always the prior afternoon. Edge is from the
+implied vs. historical earnings move; positions are slightly-OTM weekly options
+sized to lose 25–33% of per-trade capital if they go to zero (they regularly
+will). See CLAUDE.md §2, §7.
 
-Astra is built as a modular, fully serverless AWS system composed of **three independent CDK stacks**:
+## Stack layout
 
-```
-[Finnhub WebSocket Stream]
-        │
-        ▼
- ┌─────────────────────┐
- │ AstraIngestStack    │ → Real-time Fargate WebSocket listener
- │  • ECS Fargate task │
- │  • Pushes to SQS    │
- └─────────────────────┘
-        │
-        ▼
- ┌─────────────────────┐
- │ AstraDataStack      │ → Core shared infrastructure
- │  • SQS Queue        │
- │  • SNS Topic        │
- │  • DynamoDB Table   │
- │  • Secrets          │
- └─────────────────────┘
-        │
-        ▼
- ┌─────────────────────┐
- │ AstraProcessorStack │ → Filtering + dedup + Slack alerts
- │  • HeadlineProcessor│
- │  • (future) Notifier│
- └─────────────────────┘
-        │
-        ▼
-   [Slack / Email / SMS]
-```
+Three CDK stacks, partitioned by deployment lifecycle and blast radius (not
+the pipeline diagram):
 
----
+| Stack | Status | Role |
+|---|---|---|
+| **Astra-CoreStack** ([lib/core-stack.ts](lib/core-stack.ts)) | scaffolded | Stateful, long-lived: DynamoDB tables, SQS + DLQ, SNS alerts topic, Secrets Manager, S3 config bucket (STOP file + `strategy.yaml`), EBS volume for the IB Gateway box. |
+| **Astra-PipelineStack** | not yet built | Stateless research-and-decision brain: earnings/chains/news/Reddit fetchers, Bedrock sentiment, strategy/scoring engine. No money at risk; iterate freely. |
+| **Astra-ExecutionStack** | not yet built | Money-at-risk: IB Gateway EC2 box, `OrderExecutor`, `PositionMonitor`. Isolated deliberately; built last, deployed most carefully. |
 
-## ⚙️ Stack Breakdown
+Why exactly three: see CLAUDE.md §5.
 
-### 🧱 **1️⃣ AstraDataStack — Core Infrastructure**
+## Build sequence
 
-| Resource                                     | Description                                         |
-| -------------------------------------------- | --------------------------------------------------- |
-| **SQS Queue – `HeadlinesQueue`**             | Buffers incoming headlines.                         |
-| **SNS Topic – `AlertsTopic`**                | Broadcasts filtered alerts to multiple subscribers. |
-| **DynamoDB Table – `SeenArticles`**          | Deduplication using content hash (TTL 48 h).        |
-| **Secrets – `FinnhubToken`, `SlackWebhook`** | Stores API keys and alert webhooks securely.        |
+Validation is forward — there is no backtester. Build the real system, run it
+in **recommendation-only mode** against live data, review the calls against
+actual market opens, then flip to live money once the owner confirms.
 
-➡️ Long-lived, foundational stack shared across all others.
+1. Build the real infrastructure: Astra-CoreStack → Astra-PipelineStack → Astra-ExecutionStack.
+2. Run in recommendation-only mode (`execution_mode=recommend` on the
+   OrderExecutor) — full pipeline, no orders submitted, recommendations logged.
+3. Daily review loop — owner judges recommended trades against actual opens.
+4. Flip to live, tiny — 1 contract; scale only after 20+ clean live trades.
 
----
+Full sequence in CLAUDE.md §12 and [docs/earnings-system-design.md §5](docs/earnings-system-design.md#5-build-sequence-validation-via-recommendation-only-mode--no-backtester).
 
-### 📡 **2️⃣ AstraIngestStack — Real-Time Data Ingestion (Fargate WebSocket)**
+## Working with the CDK app
 
-| Component                           | Description                                                                                                           |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **FeedListener (ECS Fargate task)** | Maintains a persistent WebSocket connection to **Finnhub** and streams headlines to SQS in real time (< 1 s latency). |
-| **Container image**                 | Built from `/services/feed-listener` during CDK deployment.                                                           |
-| **Auto-Reconnect**                  | Reconnects automatically on network drop.                                                                             |
-| **Networking**                      | Public subnet, outbound HTTPS (no NAT needed).                                                                        |
-| **Logging**                         | CloudWatch Logs group `astra-feed`.                                                                                   |
-
-**Environment/Secrets**
-
-- `PROVIDER=finnhub`
-- `QUEUE_URL` – set by CDK
-- `FEED_TOKEN_SECRET_ARN` – ARN of `FinnhubToken` secret
-- `LOG_LEVEL=info` (optional)
-
-**Typical cost:** ~$9–10/month for continuous operation.
-
-**Fallback option:**
-A polling Lambda via EventBridge (~$1/month, 30 s–1 min latency) can be used for testing, but WebSocket is recommended for production.
-
----
-
-### 🧮 **3️⃣ AstraProcessorStack — Signal Detection & Alerts**
-
-| Component                    | Description                                                                                                                 |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| **HeadlineProcessor Lambda** | Consumes messages from SQS, filters for NVIDIA/OpenAI partnerships, deduplicates via DynamoDB, and publishes alerts to SNS. |
-| **Notifier Lambda (future)** | Subscribes to SNS and posts alerts to Slack.                                                                                |
-| **IAM Grants**               | Access to SQS, DynamoDB, SNS, and Secrets Manager.                                                                          |
-
-**Filtering logic**
-
-- Positive phrases: “announces partnership with”, “collaboration with NVIDIA”, “deal with OpenAI”.
-- Negative filters: “compatible with”, “developer program”, “uses NVIDIA chip”.
-- SHA-256 hash ensures duplicates aren’t re-alerted.
-
----
-
-## 💬 Example Alert
-
-> ⚡ **ACME Robotics** — partnership with **NVIDIA** > _BusinessWire • 09:14 ET_ > [Read article →](https://example.com/pr/1234)
-
----
-
-## 🧩 Deployment
-
-1. **Bootstrap once per region/account**
-
-   ```
-   cdk bootstrap
-   ```
-
-2. **Deploy all stacks**
-
-   ```
-   cdk deploy --all
-   ```
-
-   or individually:
-
-   ```
-   cdk deploy AstraDataStack
-   cdk deploy AstraIngestStack
-   cdk deploy AstraProcessorStack
-   ```
-
-3. **Add secrets manually (AWS Console → Secrets Manager)**
-
-   - `FinnhubToken`: `{"token":"YOUR_FINNHUB_API_KEY"}`
-   - `SlackWebhook`: `{"url":"https://hooks.slack.com/services/..."}`
-
-4. **Validate deployment**
-
-   - Check CloudWatch Logs → `astra-feed` → look for “Connected to Finnhub”.
-   - New headlines appear in SQS and trigger the processor.
-
----
-
-## 💰 Monthly Cost Estimate
-
-| Component           | Est. Cost         | Notes                        |
-| ------------------- | ----------------- | ---------------------------- |
-| ECS Fargate Task    | $9–10             | Always-on 0.25 vCPU / 0.5 GB |
-| SQS + SNS           | <$1               | Low message volume           |
-| DynamoDB            | $3–5              | Pay-per-request mode         |
-| Secrets Manager     | $2                | Two secrets                  |
-| CloudWatch Logs     | ~$2               | Moderate logging             |
-| **AWS Subtotal**    | **≈ $15–20/mo**   |                              |
-| **Finnhub Pro API** | **$100/mo**       | News feed                    |
-| **Total**           | **≈ $115–120/mo** | End-to-end operation         |
-
----
-
-## 🧠 Design Principles
-
-- **Always-on real-time ingestion** – < 1 s latency from newswire to alert.
-- **Serverless core** – minimal operational overhead.
-- **Modular CDK stacks** – clean dependency boundaries.
-- **Scalable by design** – supports more feeds or symbols easily.
-- **Cost-efficient** – predictable monthly compute cost.
-
----
-
-## 🚀 Roadmap
-
-| Phase | Goal                                      | Implementation                              |
-| ----- | ----------------------------------------- | ------------------------------------------- |
-| **1** | MVP with Finnhub WebSocket + Slack alerts | Fargate listener + regex filter             |
-| **2** | Add more data providers                   | Additional WebSocket containers             |
-| **3** | Sentiment & entity analysis               | Amazon Comprehend / Bedrock                 |
-| **4** | Trading signal generation                 | Add `AstraTradingStack`                     |
-| **5** | Analytics & dashboards                    | `AstraAnalyticsStack` (Athena + QuickSight) |
-
----
-
-## 🪜 Repository Structure
-
-```
-astra/
-├── bin/
-│   └── astra.ts                 # CDK app entrypoint
-├── lib/
-│   ├── astra-data-stack.ts      # Core infra (SQS, SNS, DynamoDB, Secrets)
-│   ├── astra-ingest-stack.ts    # Fargate WebSocket ingestion
-│   └── astra-processor-stack.ts # Filtering + alerts
-├── services/
-│   └── feed-listener/           # Fargate WebSocket container
-│       ├── Dockerfile
-│       ├── package.json
-│       └── src/index.ts
-├── lambdas/
-│   ├── processor/               # Headline processor Lambda
-│   └── notifier/                # Slack notifier (future)
-├── package.json
-├── tsconfig.json
-└── README.md
+```bash
+npm install          # install CDK + TS toolchain
+npm run build        # tsc (type-check + emit to dist/)
+npx cdk ls           # list stacks (currently just Astra-CoreStack)
+npm run synth        # cdk synth — render CloudFormation
+npm run diff         # cdk diff — diff against deployed state
+npm run deploy       # build + synth + deploy
 ```
 
----
+The EBS volume in Astra-CoreStack is pinned to `us-east-1a` (hardcoded in
+[bin/astra.ts](bin/astra.ts)). Astra-ExecutionStack must launch its EC2
+instance in that same AZ to attach the volume.
 
-## 🧩 Tech Stack
+Infra is TypeScript (CDK); the data/quant logic that runs inside the stacks
+(Lambdas, Fargate tasks, the EC2 service) will be Python. See CLAUDE.md §4.
 
-| Layer          | Technology                   |
-| -------------- | ---------------------------- |
-| **IaC**        | AWS CDK (TypeScript)         |
-| **Compute**    | AWS Lambda, ECS Fargate      |
-| **Messaging**  | Amazon SQS, SNS              |
-| **Storage**    | Amazon DynamoDB              |
-| **Secrets**    | AWS Secrets Manager          |
-| **Networking** | AWS VPC (public subnets)     |
-| **Monitoring** | Amazon CloudWatch            |
-| **Language**   | TypeScript (Node 20 runtime) |
+## Layout
 
----
+```
+bin/astra.ts                     CDK app entry (cdk.json points here)
+lib/core-stack.ts                CoreStack — stateful infra
+docs/earnings-system-design.md   detailed design reference
+CLAUDE.md                        rules + decisions (auto-loaded)
+```
 
-## 🧭 Naming Lineage
+## Owner to-dos (external lead time — start now)
 
-| Project       | Domain                             | Theme                            |
-| ------------- | ---------------------------------- | -------------------------------- |
-| **Northstar** | Equirig (Marketplace Intelligence) | Direction / Guidance             |
-| **Nova**      | Tithi (Matchmaking Intelligence)   | New Light / Connection           |
-| **Astra**     | Market Signal Intelligence         | Celestial Watcher / Alert System |
+- Open IBKR account, apply for options Level 3, enable API access (2–3 week lead).
+- Pick the live options-data feed (IBKR feed / Finnhub / Polygon) — feeds the
+  nightly OptionsChainFetcher.
+- Decide NAT Gateway vs. public-subnet placement for the IB Gateway EC2 box.
 
----
-
-## 🧩 Philosophy
-
-> “**Astra is designed to see before others.**”
-
-Astra doesn’t just collect data — it **listens** for meaningful signals, **filters** noise, and **acts instantly**.
-It’s the foundation for an autonomous, intelligent market-monitoring and trading-signal ecosystem.
+See CLAUDE.md §14.
 
 ---
 
-## Useful commands
-
-- `npm run build` compile typescript to js
-- `npm run watch` watch for changes and compile
-- `npm run test` perform the jest unit tests
-- `npx cdk deploy` deploy this stack to your default AWS account/region
-- `npx cdk diff` compare deployed stack with current state
-- `npx cdk synth` emits the synthesized CloudFormation template
+*Not financial advice. Earnings options strategies frequently have negative
+expectancy after spreads and commissions — especially the enter-before-
+announcement variant used here, which eats the full IV crush. Recommendation-
+only mode against live data is the gate before risking real money.*
