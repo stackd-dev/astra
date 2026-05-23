@@ -1,16 +1,12 @@
-import { Stack, StackProps, RemovalPolicy, Duration, Size, Tags, CfnOutput } from "aws-cdk-lib";
+import { Stack, StackProps, RemovalPolicy, Duration, CfnOutput } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import { Table, AttributeType, BillingMode } from "aws-cdk-lib/aws-dynamodb";
 import { Queue } from "aws-cdk-lib/aws-sqs";
 import { Topic } from "aws-cdk-lib/aws-sns";
 import { Secret } from "aws-cdk-lib/aws-secretsmanager";
 import { Bucket, BucketEncryption, BlockPublicAccess } from "aws-cdk-lib/aws-s3";
-import { Volume, EbsDeviceVolumeType } from "aws-cdk-lib/aws-ec2";
 
-export interface CoreStackProps extends StackProps {
-  /** AZ for the IB Gateway EBS volume. ExecutionStack must launch its EC2 box in this same AZ. */
-  readonly availabilityZone: string;
-}
+export interface CoreStackProps extends StackProps {}
 
 /** Stateful, long-lived infra for the earnings options trading system. See CLAUDE.md §5. */
 export class CoreStack extends Stack {
@@ -32,9 +28,8 @@ export class CoreStack extends Stack {
   public readonly alertsCredentialsSecret: Secret;
 
   public readonly configBucket: Bucket;
-  public readonly ibGatewayVolume: Volume;
 
-  constructor(scope: Construct, id: string, props: CoreStackProps) {
+  constructor(scope: Construct, id: string, props?: CoreStackProps) {
     super(scope, id, props);
 
     const RETAIN = RemovalPolicy.RETAIN;
@@ -135,17 +130,6 @@ export class CoreStack extends Stack {
       removalPolicy: RETAIN,
     });
 
-    // EBS lives in CoreStack (not ExecutionStack) so the IB Gateway session survives any
-    // ExecutionStack teardown/redeploy. ExecutionStack's EC2 instance must be in `availabilityZone`.
-    this.ibGatewayVolume = new Volume(this, "IbGatewayVolume", {
-      availabilityZone: props.availabilityZone,
-      size: Size.gibibytes(8),
-      volumeType: EbsDeviceVolumeType.GP3,
-      encrypted: true,
-      removalPolicy: RETAIN,
-    });
-    Tags.of(this.ibGatewayVolume).add("Purpose", "ib-gateway-session");
-
     new CfnOutput(this, "EarningsCalendarTableName", { value: this.earningsCalendarTable.tableName });
     new CfnOutput(this, "HistoricalMovesTableName", { value: this.historicalMovesTable.tableName });
     new CfnOutput(this, "SentimentScoresTableName", { value: this.sentimentScoresTable.tableName });
@@ -157,7 +141,5 @@ export class CoreStack extends Stack {
     new CfnOutput(this, "NewsFeedDeadLetterQueueUrl", { value: this.newsFeedDeadLetterQueue.queueUrl });
     new CfnOutput(this, "AlertsTopicArn", { value: this.alertsTopic.topicArn });
     new CfnOutput(this, "ConfigBucketName", { value: this.configBucket.bucketName });
-    new CfnOutput(this, "IbGatewayVolumeId", { value: this.ibGatewayVolume.volumeId });
-    new CfnOutput(this, "IbGatewayVolumeAz", { value: props.availabilityZone });
   }
 }

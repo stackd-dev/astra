@@ -12,8 +12,8 @@ A semi-automated **earnings options trading system**. It researches upcoming ear
 enters options positions the afternoon before the announcement, holds one overnight, and alerts
 a human at the next market open to exit. **Entry is automated; exit is manual.**
 
-This is a **ground-up rewrite** that reuses the prior `astra` repo as a *reference
-architecture* (validated patterns to keep), NOT a codebase to extend. See §3.
+This is a **ground-up rewrite** that reuses the prior `astra` repo as a _reference
+architecture_ (validated patterns to keep), NOT a codebase to extend. See §3.
 
 ---
 
@@ -34,7 +34,7 @@ Same `hold_until` rule for both: **the next market open after entry.** ENTRY IS 
 AFTERNOON BEFORE — do not build a morning-entry path. Positions carry `report_timing`
 (AMC/BMO) + `hold_until`.
 
-This is the *enter-before-the-announcement* strategy: you hold through the report and eat both
+This is the _enter-before-the-announcement_ strategy: you hold through the report and eat both
 the move AND the IV crush. It is the high-variance version. The owner has run this manually over
 months and is confident in the edge; validation before live money is via RECOMMENDATION-ONLY
 MODE on the real system against live data (see §12), not historical backtesting.
@@ -59,7 +59,12 @@ destination (alerts now go to SMS).
 - **Business logic: Python** for Lambda/Fargate tasks doing data/quant work (sentiment, scoring,
   backtesting, options math) — better libraries (pandas, numpy, options tooling). CDK (TS) can
   define Lambdas with a Python runtime. So: TS for infra, Python for logic.
-- **Broker API:** `ib_insync` (Python) talking to IB Gateway (§6).
+- **Broker API:** `ib_async` (Python) talking to IB Gateway (§6). NOTE: use `ib_async`, NOT
+  `ib_insync` — per IBKR's own docs, ib_insync is built on a legacy API release and is no longer
+  maintained; ib_async is the modernized successor by an original ib_insync developer (same API,
+  same patterns). Alternatively evaluate IBKR's new built-in Synchronous API (TWS 10.40+, Python-
+  only) for the executor/monitor — it's simpler (linear top-to-bottom code, no callbacks/threads)
+  and may cover our needs (connect, snapshot, place limit order, check status, cancel). See §6.
 - **WebSocket feed listener:** rebuild cleanly (don't copy astra's) as a general feed listener —
   preserve the pattern, not the implementation.
 
@@ -83,21 +88,48 @@ DynamoDB/EBS; (2) research vs. execution — money-losing code is categorically 
 it. Sentiment and strategy do NOT get separate stacks (tuned as one unit, never deploy
 independently). PipelineStack and ExecutionStack consume CoreStack's resources, not duplicates.
 
-## 6. IB Gateway & hosting (decided)
+## 6. IB Gateway & hosting (decided 2026-05-23)
 
-IB Gateway is IBKR's headless API connection app — the always-on local process that holds the
-authenticated link to Interactive Brokers. Your `ib_insync` code connects to it over localhost.
-It cannot be serverless (stateful, must stay logged in).
+IB Gateway runs as a **Fargate ECS service** using the community Docker image
+**`gnzsnz/ib-gateway`** (pinned to `stable`). The image bundles IB Gateway + IBC + Xvfb +
+socat + the auto-restart/re-auth logic. Your `ib_async` code connects to the Fargate task's
+public IP over the socat-republished port. Cluster `astra-execution`, service `ib-gateway`.
 
-- **Runs on a single 24/7 EC2 instance** (t3.small). IBC for auto-login, a systemd unit to keep
-  it alive, EBS for session/login files. This is the **SINGLE exception** to an all-serverless
-  system — do NOT pile other services onto it.
-- IBKR forces a daily restart (~midnight). The monitor MUST survive it and re-read open
-  positions on every restart so an overnight hold is never orphaned (worst-case failure).
-- Why EC2 not Fargate: cheaper at steady-state, SSH-debuggable when IB Gateway wedges, and
-  overnight holds require always-on. (Fargate was the prior pick; switched deliberately.)
-- **NAT Gateway is a hidden cost** (~$32/mo + $0.045/GB). Put the EC2 box in a public subnet
-  with a tight security group OR budget the NAT Gateway explicitly. Can exceed compute cost.
+- **Service: ECS Fargate**, 1 vCPU / 4 GB, single task, single AZ (us-east-1a). Roughly
+  ~$42/mo. The cluster lives in a one-AZ VPC with a public subnet (no NAT Gateway — saves
+  ~$32/mo). **EFS** persists `/home/ibgateway/tws_settings` across task replacements so
+  session tokens survive (avoids 2FA on every restart). NOTE: do NOT mount EFS at
+  `/home/ibgateway/Jts` — that's where the image bundles `jts.ini.tmpl` and other templates;
+  mounting there shadows them and the container fails. Use `tws_settings` (a separate path)
+  and set `TWS_SETTINGS_PATH` env var to match.
+- **External connection ports** (after the image's socat layer): paper = **4004**,
+  live = **4003**. *Internally* the Gateway listens on 4002/4001 (the canonical IB Gateway
+  paper/live ports), but socat republishes them so external clients use 4004/4003. This is
+  specific to the gnzsnz image — a bare Gateway install would use 4001/4002 directly.
+- **Read-Only API is the hardware-level recommend-mode guard** — keep `READ_ONLY_API=yes`
+  in the task env until you actually flip to live trading. Gateway rejects any order
+  submission even if `execution_mode` in code says otherwise. Belt-and-suspenders with
+  §12's recommend gate.
+- **Daily restart + weekly re-auth:** image env vars `AUTO_RESTART_TIME=11:59 PM` and
+  `RELOGIN_AFTER_TWOFA_TIMEOUT=yes` handle the daily restart and Saturday-night server-reset
+  re-auth automatically. Paper accounts often skip 2FA entirely on API login. Live accounts
+  will require an IBKR Mobile push at first login and after weekend resets — the monitor
+  must alert when this is needed. Session-token persistence on EFS skips 2FA on routine
+  task restarts (token tied to filesystem, not instance).
+- Why Fargate, not EC2: previous attempt at EC2 + bare-metal IB Gateway + IBC required
+  hours of debugging xterm dependencies, Xvfb access control, IBC's hardcoded `/opt/ibc`
+  defaults, TWS_MAJOR_VRSN drift, exit code 1100 mysteries. The Docker image owns all of
+  that. ~$12/mo cost delta vs t3.medium is the price of letting an actively-maintained
+  community image handle the surface area. Audit the image's Dockerfile + scripts at
+  [github.com/gnzsnz/ib-gateway-docker](https://github.com/gnzsnz/ib-gateway-docker) before
+  going live.
+- **Public IP changes on task replacement** (Fargate ENI is fresh each launch). When the
+  PipelineStack Lambda starts pulling chains, that egress IP needs to be either (a) opened
+  in the service SG dynamically, (b) routed via a NAT Gateway with a fixed Elastic IP, or
+  (c) the OptionsChainFetcher runs as another Fargate task in the same VPC and connects to
+  Gateway over the task's internal address. Decide when we get there.
+- **API pacing limit:** IBKR's TWS API default is 50 requests/sec — well above strategy
+  needs, but known.
 
 ## 7. Strategy logic
 
@@ -148,9 +180,12 @@ It cannot be serverless (stateful, must stay logged in).
 - Ongoing infra budget ~**$100/month.** AWS core + new pieces stay well under it; Bedrock
   sentiment is pennies/mo; SMS ~$10. Watch the NAT Gateway (§6).
 - **Live market data** is the main external cost: a real-time/near-real-time options-chain feed
-  for the nightly OptionsChainFetcher (implied move, IV, chains). Options: the IBKR data feed
-  itself, Finnhub, or Polygon. Pick the cheapest source that provides ATM straddle pricing + IV
-  for the candidate universe. No historical-data purchase is needed (no backtesting).
+  for the nightly OptionsChainFetcher (implied move, IV, chains). Preferred source: **IBKR's own
+  options data via the API** (a small monthly market-data subscription, ~$5–15/mo for US options)
+  — it makes the signal source and execution source the SAME, so the price you analyze matches
+  the price you trade. Finnhub/Polygon are fallbacks, but Finnhub's option-chain ATM pricing has
+  reported accuracy issues that would corrupt the implied-move signal. No historical-data
+  purchase is needed (no backtesting).
 - Build the pipeline on free/cheap data first (yfinance, free Finnhub tier), then subscribe to a
   paid live feed only when moving toward recommendation-only / live trading.
 
@@ -184,25 +219,34 @@ never auto-retuning per-trade — small samples are noise and per-trade retuning
 ## 13. Explicitly rejected (don't re-propose)
 
 - Extending old astra code (rewrite; reference only).
-- Fargate for IB Gateway (decided 24/7 EC2 — §6). Keep everything ELSE serverless; EC2 is the
-  single exception.
-- Scheduled start/stop of the EC2 box (overnight holds require always-on).
+- EC2 + bare-metal IB Gateway + IBC install (tried, abandoned 2026-05-23 — see §6 for the
+  Fargate decision).
+- Scheduled start/stop of the IB Gateway task (overnight holds require always-on).
 - Comprehend / VADER as primary sentiment (Bedrock Haiku; VADER fallback only).
 - Fully automated EXIT (manual is intentional).
 - A morning-entry path (entry is always the afternoon before).
-- Robinhood / Webull / Schwab as broker (no serious automation API). **Use Interactive Brokers**
-  (Tastytrade distant second). Account not yet opened — needs IBKR Pro + options Level 3 + API.
+- Robinhood / Webull / Schwab as broker (no serious automation API). **Use Interactive Brokers
+  Pro** (Tastytrade distant second). Account is OPEN and APPROVED with options + API access.
 - LLM making the trade decision.
 
-## 14. Owner to-dos (have external lead time — start now)
+## 14. Owner to-dos
 
-- Open IBKR account, apply options Level 3, enable API access (2–3 week lead).
-- Pick the live options-data feed source (IBKR feed / Finnhub / Polygon) for the chain fetcher.
-- Decide NAT Gateway vs. public-subnet placement for the EC2 box.
+- [DONE] IBKR Pro account opened, approved, options + API access.
+- [DONE 2026-05-23] IB Gateway running as Fargate task in paper mode; `ib_async` confirmed
+  connecting from local machine to task's public IP on port 4004; paper account `DUQ351477`
+  resolves through `managedAccounts()`.
+- [DONE] Public-subnet placement chosen (no NAT Gateway).
+- Fund the account within 45 days of approval (margin minimum $2,000) or it auto-closes.
+- Pick the live options-data feed source — leaning IBKR feed via the Fargate Gateway (one
+  source for signal + execution). Finnhub's option-chain endpoint has reported ATM-price/IV
+  inaccuracy that would corrupt the implied-move signal; avoid for chains.
+- For PipelineStack's OptionsChainFetcher (when built): decide how its Lambda reaches the
+  Gateway task — security group opening, NAT-with-EIP, or move the fetcher into ExecutionStack
+  as a sibling Fargate task (see §6 last bullet).
 
 ---
 
-*Not financial advice. Earnings options strategies frequently have negative expectancy after
+_Not financial advice. Earnings options strategies frequently have negative expectancy after
 spreads and commissions — especially the enter-before-announcement variant used here, which eats
 the full IV crush. Recommendation-only mode against live data is the gate before risking real
-money.*
+money._

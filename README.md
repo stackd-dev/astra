@@ -41,9 +41,9 @@ the pipeline diagram):
 
 | Stack | Status | Role |
 |---|---|---|
-| **Astra-CoreStack** ([lib/core-stack.ts](lib/core-stack.ts)) | scaffolded | Stateful, long-lived: DynamoDB tables, SQS + DLQ, SNS alerts topic, Secrets Manager, S3 config bucket (STOP file + `strategy.yaml`), EBS volume for the IB Gateway box. |
-| **Astra-PipelineStack** | not yet built | Stateless research-and-decision brain: earnings/chains/news/Reddit fetchers, Bedrock sentiment, strategy/scoring engine. No money at risk; iterate freely. |
-| **Astra-ExecutionStack** | not yet built | Money-at-risk: IB Gateway EC2 box, `OrderExecutor`, `PositionMonitor`. Isolated deliberately; built last, deployed most carefully. |
+| **Astra-CoreStack** ([lib/core-stack.ts](lib/core-stack.ts)) | deployed | Stateful, long-lived: DynamoDB tables, SQS + DLQ, SNS alerts topic, Secrets Manager, S3 config bucket (STOP file + `strategy.yaml`). |
+| **Astra-PipelineStack** ([lib/pipeline-stack.ts](lib/pipeline-stack.ts)) | partial — EarningsFetcher live | Stateless research-and-decision brain. ✓ EarningsFetcher (nightly Finnhub calendar → `earnings_calendar`). Pending: OptionsChainFetcher, NewsRedditIngestion, SentimentProcessor, StrategyEngine. |
+| **Astra-ExecutionStack** ([lib/execution-stack.ts](lib/execution-stack.ts)) | partial — IB Gateway live | Money-at-risk layer. ✓ IB Gateway running as a Fargate task using `gnzsnz/ib-gateway:stable`, paper mode, `READ_ONLY_API` guard on, EFS-persisted session state. Pending: OrderExecutor, PositionMonitor. |
 
 Why exactly three: see CLAUDE.md §5.
 
@@ -66,36 +66,43 @@ Full sequence in CLAUDE.md §12 and [docs/earnings-system-design.md §5](docs/ea
 ```bash
 npm install          # install CDK + TS toolchain
 npm run build        # tsc (type-check + emit to dist/)
-npx cdk ls           # list stacks (currently just Astra-CoreStack)
+npx cdk ls           # list stacks (Astra-CoreStack, Astra-PipelineStack, Astra-ExecutionStack)
 npm run synth        # cdk synth — render CloudFormation
 npm run diff         # cdk diff — diff against deployed state
-npm run deploy       # build + synth + deploy
+npm run deploy       # build + synth + deploy (--all)
 ```
 
-The EBS volume in Astra-CoreStack is pinned to `us-east-1a` (hardcoded in
-[bin/astra.ts](bin/astra.ts)). Astra-ExecutionStack must launch its EC2
-instance in that same AZ to attach the volume.
+All three stacks pin to `us-east-1a` (hardcoded in [bin/astra.ts](bin/astra.ts))
+for single-AZ simplicity and to keep EFS / Fargate co-located without
+cross-AZ NFS cost.
 
 Infra is TypeScript (CDK); the data/quant logic that runs inside the stacks
-(Lambdas, Fargate tasks, the EC2 service) will be Python. See CLAUDE.md §4.
+(Lambdas + Fargate Python containers) will be Python. See CLAUDE.md §4.
 
 ## Layout
 
 ```
-bin/astra.ts                     CDK app entry (cdk.json points here)
-lib/core-stack.ts                CoreStack — stateful infra
-docs/earnings-system-design.md   detailed design reference
-CLAUDE.md                        rules + decisions (auto-loaded)
+bin/astra.ts                          CDK app entry (cdk.json points here)
+lib/core-stack.ts                     CoreStack — stateful infra
+lib/pipeline-stack.ts                 PipelineStack — research/decision brain
+lib/execution-stack.ts                ExecutionStack — Fargate IB Gateway + (later) executor/monitor
+lambdas/earnings_fetcher/handler.py   EarningsFetcher Python handler
+docs/earnings-system-design.md        detailed design reference
+CLAUDE.md                             rules + decisions (auto-loaded)
 ```
 
-## Owner to-dos (external lead time — start now)
+## Owner to-dos
 
-- Open IBKR account, apply for options Level 3, enable API access (2–3 week lead).
-- Pick the live options-data feed (IBKR feed / Finnhub / Polygon) — feeds the
-  nightly OptionsChainFetcher.
-- Decide NAT Gateway vs. public-subnet placement for the IB Gateway EC2 box.
+- [DONE] Open IBKR account, apply for options, enable API access.
+- [DONE] IB Gateway running on Fargate in paper mode (account `DUQ351477`).
+- Fund the IBKR account within 45 days of approval (margin minimum $2,000) or
+  it auto-closes.
+- Pick the live options-data feed (currently leaning IBKR feed via the Fargate
+  Gateway, so signal source == execution source).
+- Decide how OptionsChainFetcher reaches the Gateway task (SG opening,
+  NAT+EIP, or move it into ExecutionStack as a sibling task — see CLAUDE.md §6).
 
-See CLAUDE.md §14.
+See CLAUDE.md §14 for the canonical list.
 
 ---
 

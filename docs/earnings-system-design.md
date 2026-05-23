@@ -36,19 +36,24 @@ positions from state on every restart, and alert the human if the monitor can't 
 
 ---
 
-## 1. Hosting model (decided)
+## 1. Hosting model (decided 2026-05-23)
 
-- **IB Gateway: a single 24/7 EC2 instance** (t3.small, ~2 vCPU / 2GB). Reasons: cheaper than
-  Fargate at steady-state, SSH-debuggable when IB Gateway wedges, and overnight-hold
-  flexibility requires always-on. Use IBC for auto-login, a systemd unit to keep IB Gateway
-  alive, and an EBS volume for session/login files. This box is the **single exception** to
-  the otherwise-serverless system — do NOT pile general-purpose services onto it.
+- **IB Gateway: a Fargate ECS service** running the **`gnzsnz/ib-gateway`** community Docker
+  image. 1 vCPU / 4 GB, single task in a single-AZ public-subnet VPC (no NAT Gateway).
+  ~$42/mo for the task + ~$0.30/mo for the EFS volume that persists Gateway's
+  `tws_settings` (session tokens) across task replacements. Cluster `astra-execution`,
+  service `ib-gateway`. The image bundles Gateway + IBC + Xvfb + socat + auto-restart logic,
+  which is why this isn't an EC2 box anymore — see CLAUDE.md §6, §13 for the decision and
+  the abandoned EC2 path.
+- **OrderExecutor and PositionMonitor: Fargate tasks** in the same cluster — either sidecar
+  containers in the Gateway task definition or sibling tasks in the same VPC sharing the
+  Gateway's localhost. Same `ib_async` connection pattern as if they were on EC2; the only
+  difference is they reach Gateway via the VPC's internal address instead of localhost.
 - **Everything else: serverless / ephemeral.** Data fetchers, sentiment, and strategy are
   scheduled Lambdas or on-demand Fargate tasks. They wake, work, write, and die.
-- **NAT Gateway warning:** the EC2 box and any private-subnet Lambdas making outbound calls
-  incur NAT Gateway cost (~$32/mo base + $0.045/GB). Either put the EC2 box in a public subnet
-  with a tight security group, or budget for the NAT Gateway explicitly. This can exceed the
-  compute cost — design around it.
+- **External connection ports** (via the image's socat layer): paper = 4004, live = 4003.
+  Internal IB Gateway ports remain 4001/4002 but external clients should use 4004/4003.
+  CLAUDE.md §6 has the full table.
 
 ---
 
@@ -71,7 +76,7 @@ All ephemeral. If a step fails, downstream uses what's available (sentiment is o
 scorer runs without it at lower confidence). If EarningsFetcher fails, no candidates → no
 trades → fail safe.
 
-### Entry — TRADING DAY T afternoon (EC2 box, IB Gateway live)
+### Entry — TRADING DAY T afternoon (Fargate task running IB Gateway)
 ```
 ~12:30–12:55pm PT (final ~30 min before the 1pm PT close)
   OrderExecutor reads pending_trades
@@ -200,7 +205,8 @@ Handoff.**
 ### 3.6 OrderExecutor
 - **Trigger:** scheduled on trading day T, in the **final ~30 min before the 1pm PT close
   (~12:30pm PT)** — NOT pre-market. Entry is always the afternoon before the move, for both
-  AMC (reporting T after-close) and BMO (reporting T+1 pre-open). Runs on the EC2 box.
+  AMC (reporting T after-close) and BMO (reporting T+1 pre-open). Runs as a Fargate task in
+  ExecutionStack.
 - **Inputs:** `pending_trades`; the STOP file in S3; safety-rail config.
 - **Processing:** FIRST check `s3://<config>/STOP` — if it exists, place NO trades. Enforce
   rails: max N trades/day, max total $/day, per-ticker cap, reject orders > 2x avg historical
@@ -210,11 +216,13 @@ Handoff.**
   `pending_trades`/`trade_log`, and alert the owner, but place NO order. In `live` mode, for each
   approved trade: submit limit at mid → if unfilled, cancel + resubmit at mid+1 tick → if still
   unfilled near the close, take it or skip (config flag). Must complete before the 1pm PT close —
-  there is no entry after close. Connects via `ib_insync`. The two modes share one code path so
-  what gets validated in `recommend` is exactly what runs in `live`.
+  there is no entry after close. Connects via `ib_async` (NOT `ib_insync` — see CLAUDE.md §4).
+  The two modes share one code path so what gets validated in `recommend` is exactly what runs
+  in `live`.
 - **Outputs:** fills to `live_positions` (report_timing, entry price/time, qty, hold_until);
   all events to `trade_log`.
-- **Compute:** Python service on the EC2 box (shares IB Gateway connection).
+- **Compute:** Python container in ExecutionStack's Fargate cluster (connects to the IB Gateway
+  task via its VPC-internal address on the socat-republished port 4004 paper / 4003 live).
 - **Failure:** partial fills logged; connection loss → retry, then alert + abort (never
   double-submit). Idempotency: tag each order with a trade_id so reconnect doesn't re-place.
   If entry can't complete before close, skip the trade (do NOT carry to next day — the setup
@@ -231,17 +239,20 @@ Handoff.**
   - **AMC after-hours (T evening):** capture the after-hours move as a PREVIEW signal of the
     T+1 open. Log it; do NOT alert to exit (retail can't trade options after-hours). Roll the
     preview into the morning exit alert.
-  - **Overnight persistence:** survive the IB Gateway daily restart. **On every start/restart,
-    re-read open positions from `live_positions`** so a held position is never orphaned. Run a
-    dead-man's-switch: if the monitor can't reconnect / hasn't checked in for N minutes, alert
-    the human immediately — an unmonitored open position is the worst case.
+  - **Overnight persistence:** survive the IB Gateway daily restart (the gnzsnz image
+    auto-restarts Gateway at `AUTO_RESTART_TIME=11:59 PM` — the monitor sees the connection
+    drop and reconnects). **On every start/restart, re-read open positions from
+    `live_positions`** so a held position is never orphaned. Run a dead-man's-switch: if the
+    monitor can't reconnect / hasn't checked in for N minutes, alert the human immediately —
+    an unmonitored open position is the worst case.
   - **At the next open (exit window):** compute P&L %, IV change since entry (IV crush is
     expected and large here), underlying 5-min std-dev (stabilization). Fire exit alerts on
     P&L thresholds (+25/+50/+100%, -50%), IV crush (>30% drop), stabilization, and time pings
     (open+5/30/120min). For AMC, include the after-hours preview context in the first alert.
 - **Outputs:** SMS alerts (Twilio or SNS). Does NOT trade — human exits from IBKR mobile.
-- **Compute:** Python service on the EC2 box (shares IB Gateway connection).
-- **Failure:** if it dies, systemd restarts it and it recovers open positions from state.
+- **Compute:** Python container in ExecutionStack's Fargate cluster (connects to the IB Gateway
+  task via its VPC-internal address).
+- **Failure:** if it dies, ECS restarts the task and it recovers open positions from state.
   Alert the human if it can't reconnect — an unmonitored open position is the worst case.
 - **Handoff:** human action; exits logged to `trade_log` for the analyzer.
 
@@ -276,7 +287,7 @@ Build the real system, run it live in recommendation-only mode, review against r
 flip to live money once the owner confirms.
 
 1. **Build the real infrastructure.** CoreStack → PipelineStack (real analyzers: fetchers →
-   sentiment → strategy/scoring) → ExecutionStack (EC2 + IB Gateway + executor + monitor).
+   sentiment → strategy/scoring) → ExecutionStack (Fargate IB Gateway + executor + monitor).
    Fully functional on live data.
 2. **Recommendation-only mode (THE GATE).** OrderExecutor runs with `execution_mode=recommend`:
    the full nightly + entry cycle runs but places NO orders — it records the exact trade it would
@@ -300,7 +311,9 @@ samples are noise and per-trade retuning overfits.)
 ## 6. Open items
 - Open IBKR account, options Level 3, API access (2–3 wk lead — start now).
 - Pick the live options-data feed (IBKR feed / Finnhub / Polygon) for the chain fetcher.
-- Decide NAT Gateway vs public-subnet placement for the EC2 box.
+- Decide how OptionsChainFetcher (PipelineStack Lambda) reaches the Gateway Fargate task —
+  see CLAUDE.md §6 last bullet for options (dynamic SG opening, NAT+EIP, or move the fetcher
+  into ExecutionStack as a sibling task).
 
 ---
 
