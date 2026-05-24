@@ -45,10 +45,10 @@ positions from state on every restart, and alert the human if the monitor can't 
   service `ib-gateway`. The image bundles Gateway + IBC + Xvfb + socat + auto-restart logic,
   which is why this isn't an EC2 box anymore — see CLAUDE.md §6, §13 for the decision and
   the abandoned EC2 path.
-- **OrderExecutor and PositionMonitor: Fargate tasks** in the same cluster — either sidecar
-  containers in the Gateway task definition or sibling tasks in the same VPC sharing the
-  Gateway's localhost. Same `ib_async` connection pattern as if they were on EC2; the only
-  difference is they reach Gateway via the VPC's internal address instead of localhost.
+- **OrderExecutor and PositionMonitor: Fargate tasks** in the same ComputeStack cluster —
+  either sidecar containers in the Gateway task definition or sibling tasks in the same VPC.
+  Same `ib_async` connection pattern as if they were on EC2; the only difference is they
+  reach Gateway via the VPC's internal address instead of localhost.
 - **Everything else: serverless / ephemeral.** Data fetchers, sentiment, and strategy are
   scheduled Lambdas or on-demand Fargate tasks. They wake, work, write, and die.
 - **External connection ports** (via the image's socat layer): paper = 4004, live = 4003.
@@ -206,7 +206,7 @@ Handoff.**
 - **Trigger:** scheduled on trading day T, in the **final ~30 min before the 1pm PT close
   (~12:30pm PT)** — NOT pre-market. Entry is always the afternoon before the move, for both
   AMC (reporting T after-close) and BMO (reporting T+1 pre-open). Runs as a Fargate task in
-  ExecutionStack.
+  ComputeStack.
 - **Inputs:** `pending_trades`; the STOP file in S3; safety-rail config.
 - **Processing:** FIRST check `s3://<config>/STOP` — if it exists, place NO trades. Enforce
   rails: max N trades/day, max total $/day, per-ticker cap, reject orders > 2x avg historical
@@ -221,7 +221,7 @@ Handoff.**
   in `live`.
 - **Outputs:** fills to `live_positions` (report_timing, entry price/time, qty, hold_until);
   all events to `trade_log`.
-- **Compute:** Python container in ExecutionStack's Fargate cluster (connects to the IB Gateway
+- **Compute:** Python container in ComputeStack's Fargate cluster (connects to the IB Gateway
   task via its VPC-internal address on the socat-republished port 4004 paper / 4003 live).
 - **Failure:** partial fills logged; connection loss → retry, then alert + abort (never
   double-submit). Idempotency: tag each order with a trade_id so reconnect doesn't re-place.
@@ -250,7 +250,7 @@ Handoff.**
     P&L thresholds (+25/+50/+100%, -50%), IV crush (>30% drop), stabilization, and time pings
     (open+5/30/120min). For AMC, include the after-hours preview context in the first alert.
 - **Outputs:** SMS alerts (Twilio or SNS). Does NOT trade — human exits from IBKR mobile.
-- **Compute:** Python container in ExecutionStack's Fargate cluster (connects to the IB Gateway
+- **Compute:** Python container in ComputeStack's Fargate cluster (connects to the IB Gateway
   task via its VPC-internal address).
 - **Failure:** if it dies, ECS restarts the task and it recovers open positions from state.
   Alert the human if it can't reconnect — an unmonitored open position is the worst case.
@@ -286,8 +286,9 @@ Handoff.**
 Build the real system, run it live in recommendation-only mode, review against real opens, then
 flip to live money once the owner confirms.
 
-1. **Build the real infrastructure.** CoreStack → PipelineStack (real analyzers: fetchers →
-   sentiment → strategy/scoring) → ExecutionStack (Fargate IB Gateway + executor + monitor).
+1. **Build the real infrastructure.** CoreStack (stateful) → ComputeStack (everything
+   stateless: real analyzers, IB Gateway Fargate, executor, monitor — single stack per
+   CLAUDE.md §5).
    Fully functional on live data.
 2. **Recommendation-only mode (THE GATE).** OrderExecutor runs with `execution_mode=recommend`:
    the full nightly + entry cycle runs but places NO orders — it records the exact trade it would
@@ -311,9 +312,9 @@ samples are noise and per-trade retuning overfits.)
 ## 6. Open items
 - Open IBKR account, options Level 3, API access (2–3 wk lead — start now).
 - Pick the live options-data feed (IBKR feed / Finnhub / Polygon) for the chain fetcher.
-- Decide how OptionsChainFetcher (PipelineStack Lambda) reaches the Gateway Fargate task —
-  see CLAUDE.md §6 last bullet for options (dynamic SG opening, NAT+EIP, or move the fetcher
-  into ExecutionStack as a sibling task).
+- [DONE 2026-05-23] OptionsChainFetcher → Gateway networking: resolved by the two-stack
+  consolidation (CLAUDE.md §5). Lambda runs in ComputeStack's VPC; reaches Gateway over the
+  VPC-internal address.
 
 ---
 

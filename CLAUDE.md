@@ -68,25 +68,30 @@ destination (alerts now go to SMS).
 - **WebSocket feed listener:** rebuild cleanly (don't copy astra's) as a general feed listener —
   preserve the pattern, not the implementation.
 
-## 5. Stack layout — THREE stacks only
+## 5. Stack layout — TWO stacks (consolidated 2026-05-23)
 
-Boundaries follow deployment lifecycle and blast radius, NOT the pipeline diagram. Do not split
-further without strong reason.
+The only boundary that matters for blast radius is **stateful vs stateless**. Money-safety
+gets enforced at the construct level (STOP file, READ_ONLY_API hardware guard, recommend-mode
+config flag, per-task IAM roles) — not at the stack boundary.
 
-- **CoreStack** — shared, long-lived, STATEFUL infra: DynamoDB tables, SQS, SNS, Secrets, S3
-  config bucket (holds the STOP kill-switch file), EBS volume for the EC2 box. Deployed once,
-  rarely touched, highest blast radius. Everything depends on it.
-- **PipelineStack** — the entire stateless research-and-decision "brain": all data fetchers
-  (earnings calendar, options chains, news WebSocket, Reddit/social), Bedrock sentiment, AND the
-  strategy/scoring engine. NO money-at-risk code here — iterate freely.
-- **ExecutionStack** — everything that touches the broker and real money: IB Gateway on the EC2
-  box, order executor, position monitor. Isolated deliberately: only stack that can place trades,
-  so its IAM, deploys, and blast radius are walled off. BUILD LAST, deploy most carefully.
+- **Astra-CoreStack** — shared, long-lived, STATEFUL infra: DynamoDB tables, SQS, SNS,
+  Secrets Manager, S3 config bucket (holds the STOP kill-switch file). Deployed once, rarely
+  touched. Highest blast radius; everything depends on it.
+- **Astra-ComputeStack** — everything stateless: all data fetchers (earnings calendar,
+  options chains, news WebSocket, Reddit/social), Bedrock sentiment, the strategy/scoring
+  engine, **plus** the IB Gateway Fargate task, OrderExecutor, and PositionMonitor. Single
+  VPC, single ECS cluster — Lambdas and Fargate tasks share a network so OptionsChainFetcher
+  can reach the Gateway task internally without firewall gymnastics. Money-at-risk code lives
+  alongside research code; isolation is enforced via per-task IAM, the STOP file, and the
+  `READ_ONLY_API=yes` Gateway env (see §6).
 
-Rationale: (1) stateful core vs. stateless compute — never let a routine logic deploy risk
-DynamoDB/EBS; (2) research vs. execution — money-losing code is categorically different, isolate
-it. Sentiment and strategy do NOT get separate stacks (tuned as one unit, never deploy
-independently). PipelineStack and ExecutionStack consume CoreStack's resources, not duplicates.
+Rationale: stateful vs stateless is the boundary that actually limits blast radius.
+Previously had a third "ExecutionStack" for money-at-risk isolation; that turned out to be
+over-engineering for a single-owner pre-live system — the safety rails that actually matter
+don't require a separate stack. Revisit the split when going production-scale with multiple
+developers or stricter compliance requirements. Sentiment + strategy were never going to get
+separate stacks (tuned as one unit). ComputeStack consumes CoreStack's resources via props,
+not duplicates.
 
 ## 6. IB Gateway & hosting (decided 2026-05-23)
 
@@ -123,11 +128,10 @@ public IP over the socat-republished port. Cluster `astra-execution`, service `i
   community image handle the surface area. Audit the image's Dockerfile + scripts at
   [github.com/gnzsnz/ib-gateway-docker](https://github.com/gnzsnz/ib-gateway-docker) before
   going live.
-- **Public IP changes on task replacement** (Fargate ENI is fresh each launch). When the
-  PipelineStack Lambda starts pulling chains, that egress IP needs to be either (a) opened
-  in the service SG dynamically, (b) routed via a NAT Gateway with a fixed Elastic IP, or
-  (c) the OptionsChainFetcher runs as another Fargate task in the same VPC and connects to
-  Gateway over the task's internal address. Decide when we get there.
+- **Lambda → Gateway networking is internal** thanks to the two-stack consolidation (§5).
+  OptionsChainFetcher and other Lambdas run in the same VPC as the Gateway Fargate task; they
+  reach Gateway over its VPC-internal address (private IP / service-discovery name). No SG
+  opening for external IPs, no NAT Gateway for stable egress.
 - **API pacing limit:** IBKR's TWS API default is 50 requests/sec — well above strategy
   needs, but known.
 
@@ -194,9 +198,9 @@ public IP over the socat-republished port. Cluster `astra-execution`, service `i
 No backtester. Validation is forward: build the real system, run it live but in recommendation-
 only mode, review the calls against real market opens, then flip to live money once confirmed.
 
-1. **Build the real infrastructure.** CoreStack, then PipelineStack with the real analyzers
-   (fetchers → sentiment → strategy/scoring), then ExecutionStack (EC2 + IB Gateway + executor +
-   monitor). Fully functional, connected to live data.
+1. **Build the real infrastructure.** CoreStack (stateful), then ComputeStack (everything
+   stateless: data fetchers → sentiment → strategy/scoring + IB Gateway Fargate + executor +
+   monitor — all in one stack per §5). Fully functional, connected to live data.
 2. **Recommendation-only mode (THE GATE).** The system runs the full nightly + entry cycle but
    places NO orders. Instead, at the entry window it records the exact trade it WOULD make
    (ticker, contract, side, size, entry price, reasoning/scores) to `pending_trades` /
@@ -221,6 +225,9 @@ never auto-retuning per-trade — small samples are noise and per-trade retuning
 - Extending old astra code (rewrite; reference only).
 - EC2 + bare-metal IB Gateway + IBC install (tried, abandoned 2026-05-23 — see §6 for the
   Fargate decision).
+- Three-stack split (Core + Pipeline + Execution) — consolidated to two stacks on 2026-05-23
+  per §5. Re-propose only if going production-scale with multiple developers / stricter
+  compliance.
 - Scheduled start/stop of the IB Gateway task (overnight holds require always-on).
 - Comprehend / VADER as primary sentiment (Bedrock Haiku; VADER fallback only).
 - Fully automated EXIT (manual is intentional).
@@ -240,9 +247,9 @@ never auto-retuning per-trade — small samples are noise and per-trade retuning
 - Pick the live options-data feed source — leaning IBKR feed via the Fargate Gateway (one
   source for signal + execution). Finnhub's option-chain endpoint has reported ATM-price/IV
   inaccuracy that would corrupt the implied-move signal; avoid for chains.
-- For PipelineStack's OptionsChainFetcher (when built): decide how its Lambda reaches the
-  Gateway task — security group opening, NAT-with-EIP, or move the fetcher into ExecutionStack
-  as a sibling Fargate task (see §6 last bullet).
+- [DONE 2026-05-23] OptionsChainFetcher → Gateway networking: resolved by the two-stack
+  consolidation (§5). The Lambda will run in ComputeStack's VPC and reach Gateway over its
+  VPC-internal address — no SG opening, no NAT-with-EIP needed.
 
 ---
 

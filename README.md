@@ -42,8 +42,7 @@ the pipeline diagram):
 | Stack | Status | Role |
 |---|---|---|
 | **Astra-CoreStack** ([lib/core-stack.ts](lib/core-stack.ts)) | deployed | Stateful, long-lived: DynamoDB tables, SQS + DLQ, SNS alerts topic, Secrets Manager, S3 config bucket (STOP file + `strategy.yaml`). |
-| **Astra-PipelineStack** ([lib/pipeline-stack.ts](lib/pipeline-stack.ts)) | partial — EarningsFetcher live | Stateless research-and-decision brain. ✓ EarningsFetcher (nightly Finnhub calendar → `earnings_calendar`). Pending: OptionsChainFetcher, NewsRedditIngestion, SentimentProcessor, StrategyEngine. |
-| **Astra-ExecutionStack** ([lib/execution-stack.ts](lib/execution-stack.ts)) | partial — IB Gateway live | Money-at-risk layer. ✓ IB Gateway running as a Fargate task using `gnzsnz/ib-gateway:stable`, paper mode, `READ_ONLY_API` guard on, EFS-persisted session state. Pending: OrderExecutor, PositionMonitor. |
+| **Astra-ComputeStack** ([lib/compute-stack.ts](lib/compute-stack.ts)) | partial — IB Gateway + EarningsFetcher live | Everything stateless in a single VPC + ECS cluster. ✓ IB Gateway Fargate task (`gnzsnz/ib-gateway:stable`, paper mode, `READ_ONLY_API` guard on, EFS-persisted state). ✓ EarningsFetcher Lambda (nightly Finnhub calendar). Pending: OptionsChainFetcher, NewsRedditIngestion, SentimentProcessor, StrategyEngine, OrderExecutor, PositionMonitor. |
 
 Why exactly three: see CLAUDE.md §5.
 
@@ -53,7 +52,7 @@ Validation is forward — there is no backtester. Build the real system, run it
 in **recommendation-only mode** against live data, review the calls against
 actual market opens, then flip to live money once the owner confirms.
 
-1. Build the real infrastructure: Astra-CoreStack → Astra-PipelineStack → Astra-ExecutionStack.
+1. Build the real infrastructure: Astra-CoreStack → Astra-ComputeStack.
 2. Run in recommendation-only mode (`execution_mode=recommend` on the
    OrderExecutor) — full pipeline, no orders submitted, recommendations logged.
 3. Daily review loop — owner judges recommended trades against actual opens.
@@ -66,7 +65,7 @@ Full sequence in CLAUDE.md §12 and [docs/earnings-system-design.md §5](docs/ea
 ```bash
 npm install          # install CDK + TS toolchain
 npm run build        # tsc (type-check + emit to dist/)
-npx cdk ls           # list stacks (Astra-CoreStack, Astra-PipelineStack, Astra-ExecutionStack)
+npx cdk ls           # list stacks (Astra-CoreStack, Astra-ComputeStack)
 npm run synth        # cdk synth — render CloudFormation
 npm run diff         # cdk diff — diff against deployed state
 npm run deploy       # build + synth + deploy (--all)
@@ -84,8 +83,7 @@ Infra is TypeScript (CDK); the data/quant logic that runs inside the stacks
 ```
 bin/astra.ts                          CDK app entry (cdk.json points here)
 lib/core-stack.ts                     CoreStack — stateful infra
-lib/pipeline-stack.ts                 PipelineStack — research/decision brain
-lib/execution-stack.ts                ExecutionStack — Fargate IB Gateway + (later) executor/monitor
+lib/compute-stack.ts                  ComputeStack — VPC, ECS cluster, all Lambdas + Fargate tasks
 lambdas/earnings_fetcher/handler.py   EarningsFetcher Python handler
 docs/earnings-system-design.md        detailed design reference
 CLAUDE.md                             rules + decisions (auto-loaded)
@@ -99,8 +97,9 @@ CLAUDE.md                             rules + decisions (auto-loaded)
   it auto-closes.
 - Pick the live options-data feed (currently leaning IBKR feed via the Fargate
   Gateway, so signal source == execution source).
-- Decide how OptionsChainFetcher reaches the Gateway task (SG opening,
-  NAT+EIP, or move it into ExecutionStack as a sibling task — see CLAUDE.md §6).
+- ~~Decide how OptionsChainFetcher reaches the Gateway task~~ — resolved by the
+  two-stack consolidation: OptionsChainFetcher will be a Lambda in ComputeStack's
+  VPC and reaches Gateway over the VPC-internal address.
 
 See CLAUDE.md §14 for the canonical list.
 
