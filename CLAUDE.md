@@ -59,6 +59,18 @@ destination (alerts now go to SMS).
 - **Business logic: Python** for Lambda/Fargate tasks doing data/quant work (sentiment, scoring,
   backtesting, options math) — better libraries (pandas, numpy, options tooling). CDK (TS) can
   define Lambdas with a Python runtime. So: TS for infra, Python for logic.
+- **Python Lambda packaging:** any Python Lambda with pip deps uses CDK Docker bundling
+  (`Code.fromAsset` with `bundling.image = Runtime.PYTHON_3_12.bundlingImage`). Local pip on
+  macOS produces darwin wheels that fail at Lambda runtime — established the hard way via the
+  `ib_async`/numpy incident on 2026-05-24. **Docker Desktop must be running** for `cdk
+  synth`/`cdk deploy` of these stacks. Don't propose `--platform manylinux2014_x86_64`
+  workarounds or local bundling. When we have 3+ Python Lambdas sharing deps, revisit Poetry
+  + Lambda Layers as a shared-deps optimization.
+- **All Python Lambdas in this repo are ARM64** (`Architecture.ARM_64`, Graviton2). ~20%
+  cheaper than x86_64 and avoids Docker-on-Apple-Silicon arch mismatches during bundling
+  (without this, Docker pulls the arm64 build image but Lambda is x86_64 → import errors).
+  When bundling, pin `platform: "linux/arm64"` on the bundling config so Docker pulls the
+  arm64 variant of the SAM build image regardless of host arch.
 - **Broker API:** `ib_async` (Python) talking to IB Gateway (§6). NOTE: use `ib_async`, NOT
   `ib_insync` — per IBKR's own docs, ib_insync is built on a legacy API release and is no longer
   maintained; ib_async is the modernized successor by an original ib_insync developer (same API,
