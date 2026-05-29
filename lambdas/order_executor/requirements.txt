@@ -1,2 +1,1 @@
 ib_async>=2.0.0
-pyarrow>=15.0.0

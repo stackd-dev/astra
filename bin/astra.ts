@@ -12,8 +12,17 @@ const core = new CoreStack(app, "Astra-CoreStack");
 new ComputeStack(app, "Astra-ComputeStack", {
   earningsCalendarTable: core.earningsCalendarTable,
   historicalMovesTable: core.historicalMovesTable,
-  dataFeedCredentialsSecret: core.dataFeedCredentialsSecret,
+  sentimentScoresTable: core.sentimentScoresTable,
+  pendingTradesTable: core.pendingTradesTable,
+  livePositionsTable: core.livePositionsTable,
+  tradeLogTable: core.tradeLogTable,
+  seenContentTable: core.seenContentTable,
+  newsFeedQueue: core.newsFeedQueue,
+  alertsTopic: core.alertsTopic,
   ibkrCredentialsSecret: core.ibkrCredentialsSecret,
+  dataFeedCredentialsSecret: core.dataFeedCredentialsSecret,
+  redditCredentialsSecret: core.redditCredentialsSecret,
+  alertsCredentialsSecret: core.alertsCredentialsSecret,
   configBucket: core.configBucket,
   availabilityZone: AZ,
 });

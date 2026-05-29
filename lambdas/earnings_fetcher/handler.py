@@ -103,6 +103,40 @@ def _fetch_calendar(start: date, end: date) -> list[dict[str, Any]]:
     return events
 
 
+def _fetch_past_earnings_dates(ticker: str, limit: int = 8) -> list[str]:
+    """Past earnings dates for one ticker from Finnhub /stock/earnings.
+
+    This is called from EarningsFetcher (NOT HistoricalMovesFetcher) because
+    HistoricalMovesFetcher runs inside the VPC for IB Gateway access — and
+    VPC Lambdas have no internet egress (no NAT Gateway by design). We pull
+    the dates here, where we already have public-internet networking and a
+    cached Finnhub key, and pass them through the candidate payload."""
+    qs = urlencode({"symbol": ticker, "token": _api_key()})
+    url = f"{FINNHUB_BASE}/stock/earnings?{qs}"
+    req = Request(url, headers={"Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("[%s] Finnhub /stock/earnings failed: %s", ticker, e)
+        return []
+    if not isinstance(body, list):
+        LOG.warning("[%s] unexpected /stock/earnings response: %r", ticker, body)
+        return []
+    out: list[str] = []
+    for entry in body[:limit]:
+        period = entry.get("period")
+        if not period:
+            continue
+        # Validate it's a date so HistoricalMovesFetcher can trust the format.
+        try:
+            date.fromisoformat(period)
+            out.append(period)
+        except ValueError:
+            continue
+    return out
+
+
 def _to_decimal(v: Any) -> Any:
     """DynamoDB rejects floats — convert any numeric value to Decimal via str."""
     if isinstance(v, (int, float)):
@@ -112,11 +146,12 @@ def _to_decimal(v: Any) -> Any:
 
 def _write_actionable(
     events: list[dict[str, Any]], T: date, Tp1: date
-) -> dict[str, int]:
-    """Write only the events that match the T/T+1 actionability rule."""
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Write actionable events to DDB and return them as candidate dicts for
+    the downstream SFN Map state."""
     T_str, Tp1_str = T.isoformat(), Tp1.isoformat()
     table = _dynamodb.Table(TABLE_NAME)
-    written = 0
+    candidates: list[dict[str, Any]] = []
     skipped_no_timing = 0
     skipped_unactionable = 0
     with table.batch_writer() as batch:
@@ -149,31 +184,46 @@ def _write_actionable(
             }
             item = {k: v for k, v in item.items() if v is not None}
             batch.put_item(Item=item)
-            written += 1
+            # Slim, JSON-safe candidate dict for SFN Map: only the keys that
+            # downstream Lambdas actually need as their per-invocation input.
+            # past_earnings_dates is included so HistoricalMovesFetcher (which
+            # has no internet egress from inside the VPC) can hit IB without
+            # also needing Finnhub.
+            past_dates = _fetch_past_earnings_dates(symbol, limit=8)
+            candidates.append({
+                "ticker": symbol,
+                "earnings_date": d,
+                "report_timing": hour,
+                "target_T": T_str,
+                "past_earnings_dates": past_dates,
+            })
     LOG.info(
         "Wrote %d actionable rows; skipped %d unactionable, %d with no AMC/BMO flag.",
-        written,
+        len(candidates),
         skipped_unactionable,
         skipped_no_timing,
     )
-    return {
-        "written": written,
+    return candidates, {
         "skipped_unactionable": skipped_unactionable,
         "skipped_no_timing": skipped_no_timing,
     }
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """Lambda entry. Picks T and writes only the AMC@T / BMO@T+1 candidates."""
+    """Lambda entry. Picks T, writes the actionable rows to earnings_calendar,
+    and returns the candidate list as `candidates` so the SFN Map state can
+    fan out one HistoricalMovesFetcher / OptionsChainFetcher per ticker."""
     now_utc = datetime.now(timezone.utc)
     T = _next_entry_day(now_utc)
     Tp1 = _next_trading_day(T)
     LOG.info("now_utc=%s  T=%s  Tp1=%s", now_utc.isoformat(), T, Tp1)
     events = _fetch_calendar(T, Tp1)
-    stats = _write_actionable(events, T, Tp1)
+    candidates, stats = _write_actionable(events, T, Tp1)
     return {
         "target_T": T.isoformat(),
         "target_Tp1": Tp1.isoformat(),
         "fetched": len(events),
+        "written": len(candidates),
+        "candidates": candidates,
         **stats,
     }
